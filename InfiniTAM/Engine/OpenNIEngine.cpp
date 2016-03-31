@@ -1,4 +1,4 @@
-// Copyright 2014 Isis Innovation Limited and the authors of InfiniTAM
+// Copyright 2014-2015 Isis Innovation Limited and the authors of InfiniTAM
 
 #include "OpenNIEngine.h"
 
@@ -68,6 +68,10 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 	Vector2i requested_imageSize_rgb, Vector2i requested_imageSize_d)
 	: ImageSourceEngine(calibFilename)
 {
+	// images from openni always come in millimeters...
+	this->calib.disparityCalib.type = ITMDisparityCalib::TRAFO_AFFINE;
+	this->calib.disparityCalib.params = Vector2f(1.0f/1000.0f, 0.0f);
+
 	this->imageSize_d = Vector2i(0,0);
 	this->imageSize_rgb = Vector2i(0,0);
 
@@ -83,9 +87,13 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 	rc = data->device.open(deviceURI);
 	if (rc != openni::STATUS_OK)
 	{
+		std::string message("OpenNI: Device open failed!\n");
+		message += openni::OpenNI::getExtendedError();
 		openni::OpenNI::shutdown();
 		delete data;
-		throw std::runtime_error(std::string("OpenNI: Device open failed!\n") + openni::OpenNI::getExtendedError());
+		data = NULL;
+		std::cout << message;
+		return;
 	}
 
 	openni::PlaybackControl *control = data->device.getPlaybackControl();
@@ -95,14 +103,12 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 		control->setRepeatEnabled(false);
 	}
 
-	if (useInternalCalibration) data->device.setImageRegistrationMode(openni::IMAGE_REGISTRATION_DEPTH_TO_COLOR);
+	
 
 	rc = data->depthStream.create(data->device, openni::SENSOR_DEPTH);
 	if (rc == openni::STATUS_OK)
 	{
 		openni::VideoMode depthMode = findBestMode(data->device.getSensorInfo(openni::SENSOR_DEPTH), requested_imageSize_d.x, requested_imageSize_d.y, openni::PIXEL_FORMAT_DEPTH_1_MM);
-		imageSize_d.x = depthMode.getResolutionX();
-		imageSize_d.y = depthMode.getResolutionY();
 		rc = data->depthStream.setVideoMode(depthMode);
 		if (rc != openni::STATUS_OK)
 		{
@@ -111,11 +117,16 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 		data->depthStream.setMirroringEnabled(false);
 
 		rc = data->depthStream.start();
+
+		if (useInternalCalibration) data->device.setImageRegistrationMode(openni::IMAGE_REGISTRATION_DEPTH_TO_COLOR);
 		if (rc != openni::STATUS_OK)
 		{
 			printf("OpenNI: Couldn't start depthStream stream:\n%s\n", openni::OpenNI::getExtendedError());
 			data->depthStream.destroy();
 		}
+
+		imageSize_d.x = data->depthStream.getVideoMode().getResolutionX();
+		imageSize_d.y = data->depthStream.getVideoMode().getResolutionY();
 
 		printf("Initialised OpenNI depth camera with resolution: %d x %d\n", imageSize_d.x, imageSize_d.y);
 
@@ -131,8 +142,6 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 	if (rc == openni::STATUS_OK)
 	{
 		openni::VideoMode colourMode = findBestMode(data->device.getSensorInfo(openni::SENSOR_COLOR), requested_imageSize_rgb.x, requested_imageSize_rgb.y);
-		this->imageSize_rgb.x = colourMode.getResolutionX();
-		this->imageSize_rgb.y = colourMode.getResolutionY();
 		rc = data->colorStream.setVideoMode(colourMode);
 		if (rc != openni::STATUS_OK)
 		{
@@ -146,6 +155,9 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 			printf("OpenNI: Couldn't start colorStream stream:\n%s\n", openni::OpenNI::getExtendedError());
 			data->colorStream.destroy();
 		}
+
+		imageSize_rgb.x = data->colorStream.getVideoMode().getResolutionX();
+		imageSize_rgb.y = data->colorStream.getVideoMode().getResolutionY();
 
 		printf("Initialised OpenNI color camera with resolution: %d x %d\n", imageSize_rgb.x, imageSize_rgb.y);
 
@@ -161,35 +173,64 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 	{
 		openni::OpenNI::shutdown();
 		delete data;
-		throw std::runtime_error("OpenNI: No valid streams. Exiting.");
+		data = NULL;
+		std::cout << "OpenNI: No valid streams. Exiting." << std::endl;
+		return;
 	}
 	
 	data->streams = new openni::VideoStream*[2];
 	if (depthAvailable) data->streams[0] = &data->depthStream;
 	if (colorAvailable) data->streams[1] = &data->colorStream;
+
+	if (useInternalCalibration) {
+		this->calib.trafo_rgb_to_depth = ITMExtrinsics();
+		if (depthAvailable) {
+			float h_fov = data->depthStream.getHorizontalFieldOfView();
+			float v_fov = data->depthStream.getVerticalFieldOfView();
+			this->calib.intrinsics_d.SetFrom(
+				(float)imageSize_d.x / (2.0f * tan(h_fov/2.0f)),
+				(float)imageSize_d.y / (2.0f * tan(v_fov/2.0f)),
+				(float)imageSize_d.x / 2.0f,
+				(float)imageSize_d.y / 2.0f,
+				imageSize_d.x,imageSize_d.y);
+		}
+		if (colorAvailable) {
+			float h_fov = data->colorStream.getHorizontalFieldOfView();
+			float v_fov = data->colorStream.getVerticalFieldOfView();
+			this->calib.intrinsics_rgb.SetFrom(
+				(float)imageSize_rgb.x / (2.0f * tan(h_fov/2.0f)),
+				(float)imageSize_rgb.y / (2.0f * tan(v_fov/2.0f)),
+				(float)imageSize_rgb.x / 2.0f,
+				(float)imageSize_rgb.y / 2.0f,
+				imageSize_rgb.x, imageSize_rgb.y);
+		}
+	}
 }
 
 OpenNIEngine::~OpenNIEngine()
 {
-	if (depthAvailable)
+	if (data != NULL)
 	{
-		data->depthStream.stop();
-		data->depthStream.destroy();
-	}
-	if (colorAvailable)
-	{
-		data->colorStream.stop();
-		data->colorStream.destroy();
-	}
-	data->device.close();
+		if (depthAvailable)
+		{
+			data->depthStream.stop();
+			data->depthStream.destroy();
+		}
+		if (colorAvailable)
+		{
+			data->colorStream.stop();
+			data->colorStream.destroy();
+		}
+		data->device.close();
 
-	delete[] data->streams;
-	delete data;
+		delete[] data->streams;
+		delete data;
+	}
 
 	openni::OpenNI::shutdown();
 }
 
-void OpenNIEngine::getImages(ITMView *out)
+void OpenNIEngine::getImages(ITMUChar4Image *rgbImage, ITMShortImage *rawDepthImage)
 {
 	int changedIndex, waitStreamCount;
 	if (depthAvailable && colorAvailable) waitStreamCount = 2;
@@ -204,37 +245,33 @@ void OpenNIEngine::getImages(ITMView *out)
 	if (depthAvailable && !data->depthFrame.isValid()) return;
 	if (colorAvailable && !data->colorFrame.isValid()) return;
 
-	Vector4u *rgb = out->rgb->GetData(false);
+	Vector4u *rgb = rgbImage->GetData(MEMORYDEVICE_CPU);
 	if (colorAvailable)
 	{
 		const openni::RGB888Pixel* colorImagePix = (const openni::RGB888Pixel*)data->colorFrame.getData();
-		for (int i = 0; i < out->rgb->noDims.x * out->rgb->noDims.y; i++)
+		for (int i = 0; i < rgbImage->noDims.x * rgbImage->noDims.y; i++)
 		{
 			Vector4u newPix; openni::RGB888Pixel oldPix = colorImagePix[i];
-			newPix.r = oldPix.r; newPix.g = oldPix.g; newPix.b = oldPix.b; newPix.a = 255;
+			newPix.x = oldPix.r; newPix.y = oldPix.g; newPix.z = oldPix.b; newPix.w = 255;
 			rgb[i] = newPix;
 		}
 	}
-	else memset(rgb, 0, out->rgb->dataSize * sizeof(Vector4u));
+	else memset(rgb, 0, rgbImage->dataSize * sizeof(Vector4u));
 
-	short *depth = out->rawDepth->GetData(false);
+	short *depth = rawDepthImage->GetData(MEMORYDEVICE_CPU);
 	if (depthAvailable)
 	{
 		const openni::DepthPixel* depthImagePix = (const openni::DepthPixel*)data->depthFrame.getData();
-		memcpy(depth, depthImagePix, out->rawDepth->dataSize * sizeof(short));
+		memcpy(depth, depthImagePix, rawDepthImage->dataSize * sizeof(short));
 	}
-	else memset(depth, 0, out->rawDepth->dataSize * sizeof(short));
-	//WriteToTXT((short*)depthImagePix, 307200, "d:/temp/dd.txt");
-	//exit(1);
-
-	out->inputImageType = ITMView::InfiniTAM_SHORT_DEPTH_IMAGE;
+	else memset(depth, 0, rawDepthImage->dataSize * sizeof(short));
 
 	return /*true*/;
 }
 
-bool OpenNIEngine::hasMoreImages(void) { return true; }
-Vector2i OpenNIEngine::getDepthImageSize(void) { return imageSize_d; }
-Vector2i OpenNIEngine::getRGBImageSize(void) { return imageSize_rgb; }
+bool OpenNIEngine::hasMoreImages(void) { return (data!=NULL); }
+Vector2i OpenNIEngine::getDepthImageSize(void) { return (data!=NULL)?imageSize_d:Vector2i(0,0); }
+Vector2i OpenNIEngine::getRGBImageSize(void) { return (data!=NULL)?imageSize_rgb:Vector2i(0,0); }
 
 #else
 
@@ -247,7 +284,7 @@ OpenNIEngine::OpenNIEngine(const char *calibFilename, const char *deviceURI, con
 }
 OpenNIEngine::~OpenNIEngine()
 {}
-void OpenNIEngine::getImages(ITMView *out)
+void OpenNIEngine::getImages(ITMUChar4Image *rgbImage, ITMShortImage *rawDepthImage)
 { return; }
 bool OpenNIEngine::hasMoreImages(void)
 { return false; }
